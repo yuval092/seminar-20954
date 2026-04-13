@@ -1,82 +1,68 @@
 # Chapter 5: NASS — Fuzzing Proprietary Native Android System Services
 
-Published at USENIX Security '25, **NASS [3]** (Native Android System Services) is the most advanced of the three papers in this study. It addresses the final and perhaps most significant hurdle in Android security research: the **proprietary service problem.**
+As the Android security model matured, the limitations of static analysis became impossible to ignore. Project Treble’s architectural reorganization pushed the most hardware-proximate, highly privileged code into the Vendor Hardware Abstraction Layer (HAL). Because vendors like Samsung, Qualcomm, and Xiaomi rarely release the source code for their specific hardware integrations, these critical HAL services are deployed as stripped, proprietary binaries.
 
-## 5.1 The Proprietary Blind Spot: The Running Example
+Static systems like DIFUZE and FANS, completely reliant on LLVM bitcode or Clang ASTs, found themselves locked out of this massive attack surface. In 2025, researchers introduced **NASS** (Native Android System Services) to break this deadlock. NASS abandoned source-code analysis entirely, pioneering a dynamic, binary-only approach that leverages the universal design patterns of RPC frameworks to reverse-engineer interfaces on the fly. Furthermore, it introduced a robust coverage-collection mechanism for multi-threaded daemons, finally bringing the power of evolutionary, grey-box fuzzing to the proprietary blind spot of the Android ecosystem.
 
-On a modern commercial device (e.g., a Samsung S23), the `cameraserver` daemon (from AOSP) does not communicate directly with the kernel. Instead, it talks to a proprietary vendor HAL service (e.g., `vendor.qti.hardware.camera`). This service is a binary executable with no available source code.
+## 5.1 The Proprietary Barrier: The Camera HAL
 
-This service is a "blind spot" for DIFUZE and FANS. Since there is no source code to analyze, static analysis fails completely. However, these services are highly privileged—they run as native processes with direct access to hardware and the kernel. A vulnerability in a HAL service can be exploited to bypass Android's security sandbox and eventually compromise the entire system.
+To illustrate the challenge NASS overcomes, we follow our **Camera Module** down to its lowest userspace level. When the open-source `cameraserver` framework daemon needs to physically turn on the camera lens, it initiates a Binder IPC transaction to a proprietary vendor HAL service, such as `vendor.qti.hardware.camera`.
 
-## 5.2 RPC Design Principles: The Foundation for Analysis
+Because we do not have the source code for this vendor service, we do not know its transaction IDs, nor do we know the structural layout of the `Parcel` it expects. Suppose the service requires a complex, nested object—a `CameraConfig` Parcelable—to initialize the hardware. If we send a malformed `Parcel`, the service's `onTransact` method will fail to deserialize it, and the transaction will abort.
 
-NASS is built on the discovery of three universal RPC design principles that enable the analysis of closed-source binaries:
-1.  **Ab (Abstraction of IPC binding code):** All IPC-related logic is abstracted into a "stub" or "proxy" layer. The actual business logic of the service does not handle raw Parcel data.
-2.  **Si (Single entry point):** All incoming transactions pass through a single, well-defined entry point (`onTransact` in Binder). This provides a predictable place to hook and monitor incoming requests.
-3.  **St (Standard deserialization routines):** The server stub uses standard routines exported from `libbinder.so` (e.g., `readInt32`, `readString16`) to deserialize arguments. 
+Without source code to parse, how can a fuzzer possibly know how to construct a `CameraConfig` object? NASS answers this question by turning the service's own deserialization logic against it.
 
-The NASS authors verified these principles empirically. They analyzed 528 native services across 5 commercial devices and found that 89% of proprietary services strictly complied with all three principles. The deviations were mostly minor (e.g., a service parsing a raw byte array instead of using standard types, which violates **St**, or placing business logic directly in the stub, violating **Ab**). Because the vast majority comply, dynamic analysis via standard `libbinder` hooks is highly effective.
+## 5.2 The Universal RPC Design Principles
 
-## 5.3 DGIE: Iterative Interface Probing
+The foundational insight of NASS is that, regardless of how proprietary or undocumented a system service's business logic may be, its "front door" is heavily constrained by the architectural necessities of Inter-Process Communication. The researchers formalized these constraints into three universal **RPC Design Principles** (Ab, Si, St), which we introduced in Chapter 2.
 
-The core innovation of NASS is **DGIE** (Deserialization-Guided Interface Extraction). Instead of analyzing source code, NASS observes the server's behavior as it processes transactions.
+In the context of an Android HAL service, these principles manifest practically:
+1.  **Si (Single Entry Point):** Every transaction must pass through the `onTransact` function, providing a singular, predictable chokepoint for dynamic instrumentation.
+2.  **Ab (Abstraction):** The `onTransact` stub must fully deserialize the `Parcel` *before* invoking the proprietary camera logic. If we observe the stub, we are observing pure structural validation, cleanly separated from complex application state.
+3.  **St (Standard Deserialization):** Most importantly, the proprietary HAL service cannot use proprietary byte-parsing logic. To interoperate with the rest of Android, it must link against `libbinder.so` and call standard, publicly known routines like `Parcel::readInt32()` or `Parcel::readString16()`.
 
-### 5.3.1 The Parcelable Unrolling Insight
-A major challenge in Android is the `Parcelable` object—a high-level, complex data structure. Previous black-box tools failed because they couldn't guess the internal structure of a proprietary `Parcelable`. However, NASS observes that at the ABI level, a `Parcelable` is simply "unrolled" into a linear sequence of standard **St** routines (e.g., `readInt32`, `readString16`). Because DGIE operates at the level of these standard routines, it doesn't need to know that a `CameraConfig` object exists; it only needs to fulfill the linear sequence of reads that the object's `readFromParcel` method executes.
+By dynamically monitoring the execution of these standard `St` routines within the `Si` entry point, NASS can empirically deduce the expected interface structure without ever seeing a line of source code.
 
-### 5.3.2 Iterative Refinement Algorithm
-DGIE works by repeatedly probing the server with partially-correct inputs and observing which standard deserializers (**St**) are called:
-1.  **Phase 1: Coverage-Based RPC Discovery:** It iterates through possible transaction IDs, watching for new code coverage via Frida Stalker to find valid functions.
-2.  **Phase 2: Step-by-Step Refinement:** NASS uses an iterative feedback loop to build the signature:
-    * It sends a minimal transaction. 
-    * It observes which deserializer the server calls first (e.g., `readInt32`). 
-    * It updates its internal interface model to expect an `int32`.
-    * It sends a *new* transaction with a valid integer followed by an EOF marker. 
-    * It then observes the *second* deserializer call (e.g., `readString16`). 
-    * This process repeats until the server stops calling `read` methods.
+## 5.3 DGIE: Dynamic Interface Recovery
 
-```mermaid
-graph LR
-    Start([Start Probe]) --> Send1[Send empty Parcel]
-    Send1 --> Obs1{Observe St hook}
-    Obs1 -->|readInt32| Update1[Interface: {int}]
-    Update1 --> Send2[Send Parcel: Int + EOF]
-    Send2 --> Obs2{Observe St hook}
-    Obs2 -->|readString16| Update2[Interface: {int, string}]
-    Update2 --> Success[Signature Recovered]
-```
+The core innovation of NASS is **Deserialization-Guided Interface Extraction (DGIE)**. DGIE is an iterative, probing-based algorithm that dynamically reverse-engineers the interface signature by feeding the target service partially correct inputs and watching how it reacts.
 
-This process is highly effective because the server's own stub logic acts as a "validator" that reveals the expected interface definition one call at a time. By unrolling complex objects and iteratively probing, DGIE achieves **88%** accuracy in recovering signatures, compared to just 53% for previous message-capture techniques.
+### 5.3.1 Unrolling the Parcelable
+The genius of DGIE lies in its approach to complex, high-level objects like our `CameraConfig` Parcelable. A static black-box fuzzer fails because it cannot guess the internal class structure of the object. 
 
-## 5.4 Coverage-Guided Feedback: The Evolutionary Loop
+NASS recognizes that at the binary level, object-oriented abstractions disappear. When a C++ stub deserializes a `CameraConfig` Parcelable, it simply executes a linear sequence of standard `read` calls. For instance, the `CameraConfig::readFromParcel()` function might compile down to a `readInt32()`, followed by a `readString16()`, followed by another `readInt32()`. DGIE does not attempt to reconstruct the `CameraConfig` class hierarchy; it simply monitors the dynamic execution flow and records the linear sequence of expected reads. By "unrolling" the complex object into a flat sequence of primitive deserializers, NASS reduces a structurally impossible guessing game into a simple observation task.
 
-Unlike DIFUZE and FANS, NASS is a grey-box fuzzer. It uses code coverage to guide its search for vulnerabilities, employing an evolutionary loop similar to LibFuzzer.
+### 5.3.2 The Iterative Probing Loop
+DGIE constructs the interface map through a precise feedback loop, utilizing Frida to hook the standard deserialization routines exported by `libbinder.so`.
 
-### 5.4.1 Instrumentation via Frida Stalker
-To collect coverage without source code, NASS uses dynamic binary instrumentation (DBI) with Frida Stalker. It follows a precise protocol to ensure stable and request-correlated coverage:
-1.  **Entry Point Hooking:** It hooks the `onTransact` entry point.
-2.  **PID-Based Isolation:** It checks the caller's PID. Since NASS is the one sending the transaction, it only tracks coverage if the call originates from its own fuzzer process. This isolates the fuzzer's activity from background system noise.
-3.  **Thread-Level Tracing:** It starts Frida Stalker only on the specific thread that received the `onTransact` call and stops it as soon as the function returns. This provides a clean execution trace for each individual input.
+1.  **Discovery:** NASS first iterates through all possible transaction IDs (which, in Binder, are bounded numerical values), sending empty `Parcels` and monitoring code coverage to see which IDs trigger valid execution paths in the server.
+2.  **Initial Probe:** For a discovered transaction ID, NASS sends an empty request `Parcel`.
+3.  **Observation:** The proprietary service's `onTransact` stub begins processing. NASS's Frida hooks observe that the service immediately calls `Parcel::readInt32()`. Because the `Parcel` is empty, the read fails, and the service aborts the transaction.
+4.  **Refinement:** NASS updates its internal interface model for that transaction ID: it now knows the first required argument is a 32-bit integer.
+5.  **Iteration:** NASS generates a *new* request `Parcel`, packing a valid random integer followed by an End-Of-File (EOF) marker. It sends this new `Parcel` to the service.
+6.  **Subsequent Observation:** The service successfully reads the integer, advances its instruction pointer, and then calls `Parcel::readString16()`. The string read fails due to the EOF, and the transaction aborts. NASS records the string requirement and repeats the process.
 
-## 5.5 Evaluation and Real-World Impact
+This iterative loop continues until the service stops calling deserialization routines and successfully jumps into the underlying business logic. Through empirical probing, DGIE essentially forces the proprietary binary to map out its own interface requirements, achieving an 88% accuracy rate in signature recovery—vastly outperforming passive traffic-sniffing techniques.
 
-NASS was evaluated on five commercial devices, including the Google Pixel 9 and Samsung S23. It discovered 12 unique memory-corruption vulnerabilities, resulting in five assigned CVEs.
+## 5.4 Coverage Collection in Multi-Threaded Daemons
 
-### 5.5.1 Case Study: The Samsung S23 Heap Overflow
-A significant discovery was a heap overflow in a proprietary vendor HAL service on the Samsung S23. This vulnerability was found because NASS's **DGIE (Deserialization-Guided Interface Extraction)** correctly recovered the interface of a complex, closed-source binary.
+With the interface dynamically mapped, NASS can generate structurally valid payloads. However, to find deep logic bugs, it requires the evolutionary guidance of grey-box fuzzing. Collecting stable, accurate code coverage from an Android system service is notoriously difficult. These daemons are highly concurrent, multi-threaded processes that are constantly handling background requests from the operating system, creating a chaotic environment of execution "noise."
 
-1.  **Interface Recovery via DGIE:** NASS probed the HAL service and observed that its `onTransact` method repeatedly called `readInt32` and `readString16`, which it identified as part of a nested `Parcelable` object.
-2.  **Coverage-Guided Feedback:** The evolutionary loop prioritised inputs that increased code coverage within the service's private address space, which NASS traced using Frida Stalker.
-3.  **Vulnerability Trigger:** Eventually, the fuzzer generated a `Parcel` containing a very long string embedded within the recovered `Parcelable` structure. The proprietary service's deserialization logic failed to properly check the size of the string, leading to a heap overflow.
+If a fuzzer simply attached a coverage tracker to the entire `cameraserver` process, the resulting bitmap would be polluted by hundreds of unrelated background threads, destroying the evolutionary algorithm's ability to correlate specific fuzzer inputs to specific code paths.
 
-Crucially, this vulnerability was in a vendor-specific HAL service for which no source code was available. Prior systems like DIFUZE and FANS would have been entirely unable to analyze this service, and simple message-capture tools would have struggled to understand the nested structure required to reach the vulnerable code. This case study demonstrates that for modern, proprietary Android services, dynamic interface recovery is the only path forward for security research.
+NASS solves this concurrency problem through a highly surgical application of dynamic binary instrumentation via **Frida Stalker**, tied directly to the Binder IPC semantics:
+1.  **PID-Based Caller Isolation:** NASS places a hook at the very beginning of the `onTransact` entry point. When this hook triggers, it immediately inspects the kernel-provided caller credentials associated with the IPC transaction. If the caller's Process ID (PID) does not exactly match the PID of the NASS fuzzing client, the hook silently detaches, allowing normal system traffic to process without interference.
+2.  **Thread-Localized Tracing:** If the PID matches, indicating that this specific transaction was generated by the fuzzer, NASS activates Frida Stalker *only on the specific thread* executing the `onTransact` function. 
+3.  **Synchronous Capture:** Stalker records every basic block executed by that specific thread as it processes the fuzzer's payload. As soon as the `onTransact` function returns, completing the transaction, NASS terminates the Stalker trace.
 
-## 5.6 Limitations: DBI Overhead and Asynchronous Processing
+This architecture guarantees that the coverage bitmap fed back to the evolutionary engine is perfectly isolated, representing only the synchronous execution path triggered by the fuzzer's specifically crafted input. 
 
-Despite successfully targeting proprietary binaries, the dynamic approach pioneered by NASS introduces entirely new classes of limitations.
+## 5.5 Real-World Impact on Commercial Devices
 
-The most severe operational weakness is **DBI (Dynamic Binary Instrumentation) performance overhead.** Because NASS operates on closed-source binaries, it cannot compile lightweight coverage trackers (like ASan or LibFuzzer's default instrumentation) directly into the service. Instead, it must rely on Frida Stalker to dynamically translate and hook execution instructions at runtime. This introduces massive overhead, drastically reducing the number of executions per second compared to compiled static fuzzers. 
+By combining dynamic interface recovery (DGIE) with isolated, thread-localized coverage tracking, NASS successfully applied grey-box fuzzing to the most heavily guarded layer of the Android ecosystem. 
 
-A second major limitation is its handling of **asynchronous processing.** Modern Android services are highly concurrent. If a service receives an `onTransact` call, quickly offloads the heavy processing to a background worker thread, and immediately returns, NASS's coverage collection fails. Because NASS only traces the specific thread handling the `onTransact` entry point, it becomes completely "blind" to any bugs or coverage changes occurring in the background threads.
+Evaluated across five modern commercial devices (including the Google Pixel 9 and Samsung Galaxy S23), NASS discovered 12 unique memory-corruption vulnerabilities, resulting in five assigned CVEs. Critically, many of these vulnerabilities resided in proprietary vendor HAL services—codebases that are entirely invisible to source-reliant tools like DIFUZE and FANS.
 
-Finally, while NASS adds coverage feedback, it inherits the same **stateful chain limitations** as FANS. It still struggles to discover bugs that require long, highly specific sequences of multiple different transactions, as its evolutionary loop is optimized for exploring the depth of a single transaction rather than the breadth of a multi-stage state machine.
+In one revealing case study, NASS discovered a heap buffer overflow in the proprietary `vendor.samsung.hardware.radio.network` HAL service on the Galaxy S23. Through DGIE probing, NASS unrolled a highly complex nested network message structure, determining that it required a specific sequence of seven distinct deserializers, including a signed integer representing the payload length. Once the structural barrier was bypassed, NASS's coverage-guided fuzzing engine efficiently explored the bounds-checking logic. By correlating basic-block coverage with input mutations, the fuzzer quickly discovered that passing a negative value for the length bypassed a poorly implemented size constraint, resulting in a heap overflow when the payload was subsequently copied.
+
+This discovery highlights the profound evolution of the field: by systematically reverse-engineering the universal serialization patterns of RPC frameworks, modern fuzzing techniques can completely bypass the necessity of source code, shining a light into the proprietary blind spots that protect the lowest levels of modern mobile devices.
