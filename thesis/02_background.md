@@ -1,39 +1,43 @@
 # Chapter 2: Technical Background
 
-## 2.1 Fuzzing Methodologies and the Coverage Imperative
+## 2.1 The Problem with Structured Targets
 
-Modern fuzz testing has moved well past blind random mutation. Fuzzers generally fall into two categories, differentiated by how they generate test cases:
+Modern fuzz testing has moved well past blind random mutation. The real breakthrough was grey-box fuzzing—AFL, Syzkaller, and tools like that. They use lightweight instrumentation to track code paths, saving anything that triggers a new path to mutate later. Simple idea. Surprisingly effective.
 
-*   **Mutation-Based Fuzzing** starts with a "seed corpus" of known-good inputs and applies random modifications, such as bit flips. While easy to scale, it struggles with programs expecting rigidly structured data. A minor mutation—breaking a magic header or corrupting an offset—causes the target's parser to reject the input immediately.
-*   **Generation-Based Fuzzing** builds inputs from scratch based on structural models or grammars. This ensures they pass initial validation, but the manual effort required to reverse-engineer targets and write grammars is often prohibitive.
+But fuzzers usually fall into two categories based on how they generate test cases:
 
-A major breakthrough in the field was **grey-box fuzzing**, popularized by tools like AFL and Syzkaller. These use lightweight instrumentation to track code paths executed by an input. If a mutated input triggers a new path, the fuzzer saves it as "interesting" to mutate further. This evolutionary loop lets the fuzzer explore complex state spaces without exhaustive manual modeling.
+*   **Mutation-Based Fuzzing** starts with a "seed corpus"—basically just valid, known-good inputs. The fuzzer takes these seeds and applies random changes, like flipping bits. While easy to scale, this approach struggles with targets that expect rigid structures. One wrong byte causes the parser to reject the input immediately.
+*   **Generation-Based Fuzzing** builds inputs from scratch based on a model. This ensures the inputs are valid, but the manual effort to reverse-engineer targets and write these grammars is usually way too high.
 
-That said, coverage guidance is ineffective if the fuzzer cannot bypass initial parsing checks. If 99% of inputs are rejected during validation, the fuzzer discovers no new code and stalls. This is where **interface-aware fuzzing** becomes arguably the most important requirement for auditing modern OS components. By automatically learning expected input models, these systems satisfy initial parsing constraints so that coverage-guided fuzzing can finally reach the core application logic.
+Coverage guidance only works if the fuzzer actually gets through the front door. If 99% of inputs fail validation, no new code paths are ever reached—the fuzzer just stalls. This is where **interface-aware fuzzing** becomes the main requirement. By automatically learning the expected input models, these systems satisfy the initial parsing checks. Only then can the fuzzer reach the actual application logic.
 
-## 2.2 Android's Privilege Architecture and SELinux
+## 2.2 Security and SELinux
 
-Android's security model, built on a modified Linux kernel, relies on the principle of least privilege. The system uses sandboxes to keep untrusted code isolated from critical resources. Standard Linux permissions are reinforced by Mandatory Access Control (MAC) policies through SELinux; every process and file is assigned a distinct context, and policies dictate their interaction.
+To understand why these attacks work, it helps to know how Android separates processes from each other. The core idea is least privilege—no process gets more access than it needs. The system uses sandboxes to keep untrusted code away from critical resources. Standard Linux permissions are reinforced by SELinux; every process and file is assigned a context, and policies dictate how they interact.
 
-Third-party apps run in restricted sandboxes and are denied direct access to hardware device nodes. Consequently, a malicious app cannot exploit a vulnerability in a kernel driver directly, because SELinux policies prevent it from even opening the required device file. Legitimately accessing hardware requires communication with a **system service**. These services operate within elevated SELinux domains and have the authority to talk to specific hardware drivers. 
+Third-party apps run in very restricted sandboxes. They can't access hardware nodes directly. A malicious app cannot exploit a vulnerability in a kernel driver directly, because SELinux policies prevent it from even opening the required device file. Legitimately accessing hardware requires talking to a system service. That process holds the elevated SELinux context needed to open the hardware node on behalf of the requester.
 
-## 2.3 Hardware Abstraction Layers (HAL) and Project Treble
+That is actually by design—not a flaw. But it also means that the system service becomes the boundary an attacker has to cross to get to the hardware.
 
-To standardize the ecosystem and simplify updates, Google introduced Project Treble in Android 8. Before Treble, framework code and vendor-specific hardware drivers were tangled together within the same processes. Project Treble modularized this by introducing the **Vendor Hardware Abstraction Layer (HAL)**.
+## 2.3 HALs and Project Treble
 
-The Vendor HAL acts as a boundary between the open-source Android framework (AOSP) and proprietary hardware implementations written by Original Equipment Manufacturers (OEMs). Hardware-specific logic was isolated into distinct vendor processes, and communication across this boundary was standardized over Binder IPC. Modern devices run numerous proprietary HAL services (e.g., `vendor.camera.hal`) with high privileges. If an attacker can exploit a privileged system service through a legitimate channel, they hijack its elevated SELinux context, providing a clear path toward the kernel.
+To understand why so much code became proprietary, it helps to look at Project Treble. Google introduced it in Android 8 to standardize the ecosystem and simplify updates. Before Treble, framework code and vendor-specific drivers were tangled together in the same processes. Treble modularized this by introducing the **Vendor Hardware Abstraction Layer (HAL)**.
 
-## 2.4 The Kernel Boundary: `ioctl`
+The Vendor HAL is the boundary between the open-source Android framework and proprietary hardware code written by vendors. Hardware logic was moved into distinct processes, and communication across this boundary was standardized over Binder IPC. Modern phones run a lot of proprietary HAL services with very high privileges. 
 
-When a userspace process needs to talk directly to the Linux kernel—for example, a HAL service controlling a hardware driver—it typically uses the `ioctl` (Input/Output Control) system call. The `ioctl` interface is a catch-all for generic, device-specific operations. Its signature is simple:
+If an attacker can exploit one of these services, they hijack its elevated context, providing a direct path toward the kernel.
+
+## 2.4 The `ioctl` Boundary
+
+When a userspace process needs to talk directly to the kernel—like a HAL service controlling a driver—it usually uses the `ioctl` (Input/Output Control) system call. The `ioctl` interface is basically a catch-all for generic, device-specific operations. Its signature is simple:
 
 ```c
 int ioctl(int fd, unsigned long request, ...);
 ```
 
-The real complexity lies in the `request` parameter and the variadic third argument, which is almost always a pointer to a userspace data structure. The driver uses the command identifier to select an internal handler, then copies data into kernel memory using functions like `copy_from_user()`.
+The real complexity is in the `request` parameter and the variadic third argument. That third argument is almost always a pointer to a userspace structure. The driver uses the command ID to select a handler, then copies data into kernel memory.
 
-A simplified vulnerable `ioctl` handler demonstrates the "deserialization barrier":
+A simplified vulnerable `ioctl` handler shows why this is a barrier:
 
 ```c
 struct sensor_config {
@@ -44,31 +48,31 @@ struct sensor_config {
 
 long sensor_ioctl_handler(struct file *file, unsigned int cmd, unsigned long arg) {
     struct sensor_config config;
-    
+
     if (cmd == SENSOR_CONFIG_CMD) {
         if (copy_from_user(&config, (void __user *)arg, sizeof(config))) {
             return -EFAULT;
         }
-        
+
         char *kernel_buffer = kmalloc(config.data_length, GFP_KERNEL);
         if (copy_from_user(kernel_buffer, config.user_buffer, config.data_length)) {
             kfree(kernel_buffer);
             return -EFAULT;
         }
-        
+
         return 0;
     }
     return -ENOTTY;
 }
 ```
 
-If a fuzzer supplies a pointer to a randomly generated buffer, the driver interprets it as a `sensor_config` struct. When it validates the embedded `user_buffer` pointer—likely full of random values—it causes an invalid memory access and triggers a kernel panic. The system crashes before the fuzzer can explore deeper logic.
+If a fuzzer sends a pointer to a random buffer, the driver tries to read it as a `sensor_config` struct. When it tries to validate the `user_buffer` pointer—which is just random values—it causes an invalid memory access. The system crashes before the fuzzer can even explore the logic.
 
-## 2.5 The Userspace Boundary: Binder IPC Architecture
+## 2.5 Binder and the Semantic Barrier
 
-Communication *between* userspace processes relies on **Binder**, a custom Remote Procedure Call (RPC) mechanism. When an app talks to a service, it asks the `ServiceManager` for a handle. The client-side Proxy object packs arguments into a linear container called a `Parcel`, which is routed through the `/dev/binder` kernel driver to the target service.
+When two userspace processes need to talk to each other on Android, they go through Binder — a custom RPC mechanism built right into the kernel. When an app talks to a service, it asks for a handle. The client-side Proxy object packs arguments into a container called a `Parcel`, which is routed through the kernel to the target service.
 
-On the receiving end, the service's Stub object unpacks the `Parcel` inside a dispatch function:
+On the receiving end, the service unpacks the `Parcel` inside a dispatch function:
 
 ```cpp
 status_t TargetService::onTransact(uint32_t code, const Parcel& data, Parcel* reply, uint32_t flags) {
@@ -78,10 +82,10 @@ status_t TargetService::onTransact(uint32_t code, const Parcel& data, Parcel* re
 
             int32_t session_id;
             if (data.readInt32(&session_id) != NO_ERROR) return BAD_VALUE;
-            
+
             String16 package_name;
             if (data.readString16(&package_name) != NO_ERROR) return BAD_VALUE;
-            
+
             status_t res = this->executeLogic(session_id, package_name);
             reply->writeInt32(res);
             return NO_ERROR;
@@ -92,13 +96,13 @@ status_t TargetService::onTransact(uint32_t code, const Parcel& data, Parcel* re
 }
 ```
 
-This is the semantic barrier. The content a `Parcel` should carry is not fixed—it depends on values the service reads earlier in the same transaction. Misalign this sequence by even one field and the entire transaction is silently dropped.
+This is what we call the semantic barrier. The content a `Parcel` should carry isn't fixed—it depends on values the service reads earlier in the same transaction. If you misalign this sequence by even one field, the whole transaction is just silently dropped.
 
-### 2.5.1 Android Interface Definition Language (AIDL)
+### 2.5.1 AIDL and Machine-Generated Code
 
-The reason this process is so rigid is because it is machine-generated. Developers define interfaces using **AIDL**, and the AIDL compiler generates the Proxy and Stub classes. The generated Stub contains the `onTransact` method, filled with standard library calls to unpack arguments. Consequently, interface structures are predictable and follow universal design principles.
+The reason this process is so rigid is that it is machine-generated. Developers define interfaces with **AIDL**, and the compiler generates the code. Because of this, interface structures are very predictable and follow standard design principles.
 
-### 2.5.2 Universal RPC Design Principles
+### 2.5.2 Universal RPC Principles
 
 Research on modern RPC frameworks reveals architectural similarities that aid systematic analysis. These converge on three **RPC Design Principles**:
 
@@ -106,10 +110,11 @@ Research on modern RPC frameworks reveals architectural similarities that aid sy
 2.  **Ab (Abstraction of IPC binding code)** isolates IPC transport from business logic. Standard "stub" layers handle the validation and receipt of data.
 3.  **Si (Single Entry Point)** funnels remote requests through a predictable function signature, such as `onTransact` in Binder, providing a reliable interception point.
 
-## 2.6 Program Analysis Techniques: Static vs. Dynamic
+## 2.6 Static vs. Dynamic Analysis
 
-To figure out interface models automatically, researchers use program analysis techniques categorized as static or dynamic.
+To figure out interface models automatically, researchers use either static or dynamic analysis.
 
-**Static Analysis** examines code or binaries without execution. **AST Extraction** analyzes the Abstract Syntax Tree generated by a compiler; this preserves human context, like variable names, but requires source code. **IR/Bitcode Analysis** looks at intermediate representations, such as LLVM bitcode, providing a platform-independent view of data flow across functions.
+**Static Analysis** looks at code or binaries without actually running them. FANS uses AST extraction, which works from the Abstract Syntax Tree generated by Clang. This preserves real human context: variable names and custom type names that usually disappear in compiled binaries. Other static tools analyze Intermediate Representation (IR) or bitcode; while IR analysis is platform-agnostic, it strips away that semantic richness and human context.
 
-**Dynamic Analysis** monitors behavior during execution. **Dynamic Binary Instrumentation (DBI)** frameworks, such as Frida, inject a tracing engine into a running process. DBI intercepts instructions just before execution, monitoring memory accesses and control flow. While DBI works on closed-source code, it introduces performance overhead. 
+**Dynamic Analysis** monitors behavior during execution. **Dynamic Binary Instrumentation (DBI)** frameworks, like Frida, inject a tracing engine into a running process. While DBI works on closed-source code, it does introduce quite a bit of performance overhead. 
+ 
