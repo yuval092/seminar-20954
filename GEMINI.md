@@ -1,42 +1,28 @@
-# Seminar: Interface-Aware Fuzzing on Android
+# Project Overview
 
-This workspace is dedicated to an academic seminar for a Bachelor's degree, focused on researching and synthesizing advanced fuzzing techniques for the Android operating system.
+This directory contains the materials for a Bachelor's degree seminar project focused on "Interface-Aware Fuzzing on Android". The seminar involves deep research into three core academic papers (DIFUZE, FANS, and NASS) to understand the evolution of fuzzing techniques across different privilege layers in the Android operating system (kernel drivers, open-source system services, and proprietary HAL services). 
 
-## Project Overview
+The goal of the project is to produce a comprehensive written thesis (spanning several chapters) and deliver a 45-minute oral presentation with slides, successfully explaining these complex concepts to a general Computer Science audience.
 
-The seminar follows the evolution of "interface-aware" fuzzing through three seminal research papers. The core objective is to produce a high-quality written thesis (several dozen pages) and a 45-minute oral presentation demonstrating deep conceptual understanding and original analysis.
+# Directory Overview
 
-### The Research Arc
-1.  **DIFUZE (2017):** Focuses on the kernel layer. It uses static analysis (LLVM) to recover `ioctl` interfaces for device drivers, enabling structured input generation where random bytes fail.
-2.  **FANS (2020):** Moves up to Android system services. It extracts interface models from ASTs to handle Binder IPC, including complex multi-level interfaces and transaction dependencies.
-3.  **NASS (2025):** Addresses the "proprietary blind spot." It uses Deserialization-Guided Interface Extraction (DGIE) to fuzz closed-source HAL services without source code, adding coverage-guided feedback.
+The repository is structured to separate the research material, the planning and strategy documents, and the actual thesis drafts.
 
-## Directory Structure
+*   `README.md`: Contains the mentor's instructions, grading criteria, and the selected papers for the seminar.
+*   `game_plan/`: A directory containing various Markdown files that outline the strategy, timeline, and structuring for both the written thesis and the presentation (e.g., `plan.md`, `presentation_plan.md`).
+*   `papers/`: Contains the PDF files of the three selected research papers (DIFUZE, FANS, NASS) along with their corresponding Markdown summary notes.
+*   `thesis/`: Contains the actual Markdown drafts of the thesis chapters, divided systematically from the abstract (`00_abstract.md`) and introduction (`01_introduction.md`) through to the conclusion (`08_conclusion.md`), along with a Table of Contents (`TOC.md`) and bibliography.
 
-- **`thesis/`**: Contains the draft chapters of the written thesis in Markdown format.
-    - `TOC.md`: The master Table of Contents.
-    - `01_introduction.md` through `07_conclusion.md`: Individual chapters tracing the chronological and technical arc.
-- **`game_plan/`**: Strategy documents and task lists.
-    - `plan.md`: The primary strategy document containing deep summaries, the narrative arc, and the thesis/presentation outlines.
-    - `presentation_plan.md`: Specific strategy for the 45-minute lecture and slide design.
-    - `expansion_plan.md` & `thesis_finalization_plan.md`: Detailed task lists for project completion.
-- **`papers/`**: Source materials.
-    - Contains the original PDFs and Markdown summaries (`DIFUZE.md`, `FANS.md`) of the research papers.
-- **`README.md`**: Contains the mentor's specific instructions, grading criteria, and the official project objectives.
+# Key Files
 
-## Usage and Context
+*   `README.md`: The foundational document defining the scope, mentor expectations, and milestones (progress meetings, final exam) for the seminar.
+*   `game_plan/plan.md`: The central strategic document detailing the core narrative, key takeaways from each paper, a proposed presentation structure, and a detailed task timeline.
+*   `thesis/TOC.md`: The Table of Contents outlining the structure of the written thesis.
+*   `papers/*.pdf` & `papers/*.md`: The source material being studied and the student's notes on them.
 
-### Research & Analysis
-When assisting with research, refer to `game_plan/plan.md` for high-signal summaries of the core papers. Ensure all technical explanations align with the "chronological arc" (DIFUZE → FANS → NASS).
+# Usage
 
-### Thesis Writing
-Adhere to the structure defined in `thesis/TOC.md`. Maintain a professional, academic tone that prioritizes conceptual depth and original examples over "dry" summaries, as mandated by the mentor in `README.md`.
-
-### Presentation Design
-Follow the "Visuals-First, Text-Minimal" guidelines in `README.md`. Focus on architecture diagrams, animated walkthroughs of algorithms (like DGIE), and layer diagrams showing the Android attack surface.
-
-## Key Technical Concepts
-- **Interface-Awareness:** The ability of a fuzzer to understand and conform to the expected input structure of a target interface (ioctl, Binder, etc.).
-- **Dependency Modeling:** Inferring how different IPC transactions or arguments rely on each other (FANS).
-- **DGIE (Deserialization-Guided Interface Extraction):** Dynamically probing a service to learn its interface by observing which deserialization routines it calls (NASS).
-- **Attack Surface Shift:** The migration of vulnerabilities from the Linux kernel to system services and proprietary HALs.
+This directory is intended to serve as a comprehensive workspace for writing the seminar thesis and preparing the presentation. 
+*   The `game_plan/` documents should be used to track progress, reference the project's narrative, and maintain the structural integrity of the deliverables.
+*   The `papers/` directory serves as the primary reference material.
+*   The `thesis/` directory is where the active writing and editing of the final deliverables take place. Markdown is used for drafting, which can be compiled or exported to a final format (like PDF) prior to submission.

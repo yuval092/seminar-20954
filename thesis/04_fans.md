@@ -1,79 +1,63 @@
 # Chapter 4: Userspace System Service Fuzzing: The FANS Approach
 
-As Android's security architecture matured, the primary attack surface moved upward from the Linux kernel into native system services. These userspace daemons talk to each other primarily through the Binder Inter-Process Communication (IPC) mechanism. Published in 2020, **FANS** (Fuzzing Android Native System Services) [2] tackled the difficult challenge of bringing interface-aware fuzzing up to this higher-level domain. 
+The primary attack surface migrated from the kernel into native system services as Android's security architecture matured. These userspace daemons communicate primarily through the Binder Inter-Process Communication (IPC) mechanism. In 2020, **FANS** (Fuzzing Android Native System Services) [2] addressed the challenge of applying interface-aware fuzzing to this higher-level domain. 
 
 ## 4.1 The Semantic Barrier of Binder IPC
 
-Unlike the `ioctl` boundary, which relies on rigid, static C structures, the Binder IPC boundary works through sequential, stateful serialization. When an app wants to talk to a service, it marshals its arguments into a linear container called a `Parcel`. On the receiving end, the service's `onTransact` dispatcher extracts these arguments by making a series of sequential read calls (like `data.readInt32()`).
+The Binder IPC boundary operates through sequential, stateful serialization rather than the rigid C structures found at the `ioctl` boundary. When an app talks to a service, it marshals arguments into a linear container called a `Parcel`. On the receiving end, the `onTransact` dispatcher extracts these arguments by making sequential read calls, such as `data.readInt32()`.
 
-This mechanism creates a tricky "semantic barrier." What a `Parcel` should contain—and in what order—often depends entirely on the runtime values of the variables that were just read. 
+This is the semantic barrier. The content a `Parcel` should carry is not fixed—it depends on values the service reads earlier in the same transaction. A Bluetooth pairing transaction illustrates the problem. The service reads a boolean flag first—`has_pin_code`. If that flag is set, the service expects to read a string representing the PIN; if it is false, it skips the string and moves to a device identifier. 
 
-To make this concrete, imagine a Bluetooth system service handling a device-pairing transaction. The expected payload isn't just a fixed-size block of memory. Instead, the service might first read an integer acting as a boolean flag called `has_pin_code`. If that flag is set to true, the service immediately expects to read a string representing the actual PIN. If the flag is false, it skips the string entirely and moves on to reading a device identifier. 
-
-If a fuzzer doesn't understand this conditional logic, it will almost certainly misalign the data stream. It might provide a string when an integer is expected, causing the service's parser to throw an error and drop the connection. To build a valid `Parcel`, a fuzzer needs a semantic map of how the `onTransact` dispatcher makes decisions.
+If a fuzzer doesn't understand this conditional logic, it misaligns the stream. The deserialization routine reads a string where it expected an integer, returns `BAD_VALUE`, and the transaction is dropped—silently, from the fuzzer's perspective. What the fuzzer actually needs is a semantic map of the `onTransact` dispatcher: which variables are conditional on prior reads, which trigger loops, and which signal early exit.
 
 ## 4.2 The Four Stages of FANS's Operation
 
-To systematically map out and test these stateful Binder interfaces, FANS divides its operation into four distinct stages:
-1.  **Interface Collection:** Discovering all the available top-level and hidden multi-level interfaces within the Android source code.
-2.  **Interface Model Extraction:** Analyzing the Abstract Syntax Tree (AST) to figure out the exact names, types, and conditional logic governing the variables inside the `Parcel`.
-3.  **Dependency Inference:** Connecting the dots by figuring out which variables and interfaces rely on outputs from previous transactions.
+To systematically map out these stateful Binder interfaces, FANS divides its operation into four stages:
+1.  **Interface Collection:** Discovering all available top-level and hidden multi-level interfaces.
+2.  **Interface Model Extraction:** Analyzing the AST to determine the names, types, and logic governing variables.
+3.  **Dependency Inference:** Determining which variables and interfaces rely on outputs from previous transactions.
 4.  **The Fuzzer Engine:** Generating the actual transactions in the correct order to test the live device.
-
-Let's look at how each stage tackles the semantic complexities of Binder.
 
 ## 4.3 Stage 1: Interface Collection and Multi-Level Interfaces
 
-The first step is simply figuring out what there is to test. A significant contribution of FANS was highlighting the "multi-level interface" problem. An empirical analysis by the authors revealed that about 37% of native interfaces aren't directly registered with the central `ServiceManager`. Instead, these hidden interfaces are only returned dynamically after you successfully interact with a top-level interface. A fuzzer that only knows about the public directory is basically blind to over a third of the attack surface.
-
-FANS collects these by scanning compilation commands and tracking the creation of these nested objects, ensuring it has a complete list of targets before it starts looking at their internal logic.
+The initial step is identifying what there is to test. FANS highlighted the "multi-level interface" problem: approximately 37% of native interfaces are not registered with the central `ServiceManager`. These hidden interfaces are returned dynamically after interacting with a top-level interface. A fuzzer limited to the public directory is blind to over a third of the attack surface. FANS scans compilation commands to track the creation of these nested objects, ensuring a complete list of targets before analyzing internal logic.
 
 ## 4.4 Stage 2: Interface Model Extraction via AST
 
-To figure out how the `Parcel` should be structured, FANS takes a different route than DIFUZE. Instead of using LLVM bitcode, it analyzes the **Abstract Syntax Tree (AST)** generated by the Clang compiler.
+To determine `Parcel` structure, FANS analyzes the **Abstract Syntax Tree (AST)** generated by the Clang compiler. The AST preserves the human context that machine instructions strip away, including variable names and custom types. Knowing an integer represents a `pid_t` tells the fuzzer to generate realistic process numbers rather than random digits.
 
-The AST is incredibly useful because it preserves the high-level human context that is usually stripped away when code is compiled down to machine instructions. It keeps the exact variable names (like `target_package_name`) and custom type definitions. This is crucial because a variable's name often hints at what kind of data it expects. Knowing that an integer represents a `pid_t` (Process ID) tells the fuzzer to generate realistic process numbers rather than just random digits.
+FANS scans the AST to categorize variables into distinct patterns:
 
-FANS scans the AST to find every transaction inside an interface and categorizes the expected variables into a few distinct patterns:
-
-1.  **Sequential Variables:** Variables that are read no matter what (like a basic interface token).
-2.  **Conditional Variables:** Variables that are only read if a preceding `if` statement is satisfied.
-3.  **Loop Variables:** Variables read inside a loop, where an earlier integer usually tells the code how many times to execute the loop. The fuzzer has to link these two together so it generates the right number of elements.
-4.  **Return Statements:** FANS also looks at where the code exits early. Execution paths that quickly hit error codes are given a lower priority so the fuzzer doesn't waste time on them.
+1.  **Sequential variables** are read regardless of external factors—basic interface tokens and session markers that every transaction must include.
+2.  **Conditional variables** appear only when a prior `if`-branch is taken. Miss the condition, and the stream misaligns silently.
+3.  **Loop variables** are perhaps the trickiest: the loop count is set by an earlier integer, so FANS must link those two reads together. Getting this wrong produces an immediately misaligned `Parcel`.
+4.  **Return statements**—specifically paths that exit early with error codes—help the fuzzer deprioritize dead ends. Spending cycles on validation failures is wasteful; FANS maps these exits and routes around them.
 
 ## 4.5 Stage 3: Dependency Inference
 
-Android system services are highly stateful. To trigger a deep vulnerability, you usually have to send a specific sequence of API calls. For example, you might have to first call `initialize_session()` to get a unique integer token, and then you have to include that exact same token when you call `start_capture()`.
+Android system services are stateful; triggering a vulnerability often requires a specific sequence of API calls. You might call `initialize_session()` to get a unique integer token, then include that token when calling `start_capture()`. FANS formalizes this through **Dependency Inference**, mapping two types:
 
-FANS formalizes this state-tracking through **Dependency Inference**. It maps out two types of dependencies:
+**1. Interface Dependencies:** FANS tracks how nested interfaces are created via `writeStrongBinder` and used via `readStrongBinder`. This builds a roadmap to traverse deep into the system.
 
-**1. Interface Dependencies:** FANS maps how nested interfaces are created and used. When a service passes a nested interface back to a client, it calls `writeStrongBinder`. When it expects one as input, it calls `readStrongBinder`. By linking these calls, FANS builds a roadmap showing how to traverse deep into the system.
-
-**2. Variable Dependencies:** To figure out which variables rely on each other across different transactions, FANS uses a clever Name and Type Matching algorithm. It looks at all the outputs generated by the service and all the inputs expected by the service. If it finds an output variable and an input variable in different transactions that have the exact same data type, it checks for a connection. For complex objects, it assumes they are related. For basic numbers or strings, it checks if their names are similar (e.g., correlating an output named `active_session_id` with an input named `target_session_id`). 
+**2. Variable Dependencies:** To determine which variables rely on each other across transactions, FANS uses a Name and Type Matching algorithm. If an output and an input in different transactions share a data type, it checks for a connection. For complex objects, the relationship is assumed; for primitive types, it correlates similar names, such as an output `active_session_id` and an input `target_session_id`. 
 
 ## 4.6 Stage 4: The Fuzzer Engine
 
-With all this information mapped out, the fuzzer engine goes to work. When generating a test case, it doesn't just fire blindly. It follows a strict priority order:
-*   First, it fulfills any structural constraints (like making sure a loop size integer matches the actual number of items generated).
-*   Second, it checks the dependency graph. If an input variable requires an active session ID, it will automatically call the initialization transaction first to grab a valid ID.
-*   Third, it uses the AST hints (like variable names and types) to generate plausible data.
+With this information, the fuzzer engine generates test cases according to a priority order:
+*   **Structural constraints** are fulfilled first, ensuring loop sizes match the elements generated.
+*   **Dependency checks** follow. If an input requires a session ID, the initialization transaction is called to retrieve a valid one.
+*   **AST hints**—variable names and types—are used to generate plausible data.
 
-By respecting this order, FANS can successfully navigate deep state machines.
+## 4.7 Case Studies
 
-## 4.7 Real-World Case Studies
-
-The true value of FANS's dependency inference is demonstrated by its success in navigating complex system states to uncover vulnerabilities.
+The efficacy of FANS's dependency inference is best shown through its results.
 
 **Multi-Process Vulnerability (`netd`):**
-FANS discovered an unexpected stack buffer overflow within the Linux `ip6tables-restore` binary, reachable via the Android `netd` (network daemon) system service. Triggering this vulnerable path required an active Binder reference to a previously configured network interface. Because FANS's algorithm linked the output of an interface-creation transaction to the input of the vulnerable transaction, the fuzzer successfully synthesized the multi-stage sequence necessary to deliver a malicious payload across three separate processes.
+FANS discovered a stack buffer overflow in `ip6tables-restore`, reachable via the `netd` daemon. Triggering this path required an active Binder reference to a previously configured network interface. Because FANS linked the output of an interface-creation transaction to the input of the vulnerable transaction, it successfully synthesized a sequence across three separate processes.
 
-**Inadequate Server-Side Validation (`IDrm` and `statsd`):**
-FANS also identified vulnerabilities resulting from poor input validation. In the `IDrm` interface, a `readVector` function allocated memory based on a `size` parameter deserialized directly from the `Parcel`. Because AST analysis retained the semantic context of the `size` parameter, the fuzzer deliberately generated boundary values (e.g., `-1`). The absence of a sanity check on this parameter triggered an immediate `new_capacity` overflow.
+**Server-Side Validation Issues:**
+FANS identified vulnerabilities from poor input validation in `IDrm` and `statsd`. In `IDrm`, a `readVector` function allocated memory based on a `size` parameter. By using semantic context from the AST, the fuzzer generated boundary values—like `-1`—to trigger a `new_capacity` overflow. Similarly, `statsd` used the size of one array as an iteration count for three distinct arrays, failing to verify that all were the same length. FANS supplied mismatched sizes, leading to an OOB memory violation.
 
-Similarly, in the `statsd` daemon, FANS discovered an Out-Of-Bound (OOB) access. The service utilized the size of one array as the iteration count for three distinct arrays, failing to verify that all the arrays were actually the same length. The fuzzer exploited this by supplying arrays of mismatched sizes, leading straight to an OOB memory violation.
+## 4.8 The Source Code Requirement
 
-## 4.8 The "Open-Source Blind Spot"
-
-While FANS demonstrated that modeling semantics and dependencies is vital for userspace fuzzing, its approach has one fatal flaw: it absolutely requires access to the source code. 
-
-AST analysis is only possible if you can compile the target C++ code. As the Android ecosystem evolved, particularly following Project Treble, the most privileged, hardware-proximate code was migrated into closed-source, proprietary HAL binaries developed by original equipment manufacturers (OEMs). Because these binaries are distributed without source code, AST extraction is impossible. Consequently, static analysis tools like FANS remain blind to the proprietary sector of the Android attack surface, pushing the research community to develop dynamic analysis techniques instead.
+Static analysis has a hard ceiling, and Project Treble drove right into it. The tools are excellent—FANS's AST analysis is genuinely sophisticated—but source code is not optional. It is the foundation everything else is built on. As the ecosystem evolved, the most privileged code was migrated into proprietary HAL binaries developed by hardware vendors. Because these binaries are distributed without source code, AST extraction is impossible. Static analysis remains blind to this proprietary sector, forcing a move toward dynamic techniques.
